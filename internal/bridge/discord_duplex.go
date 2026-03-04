@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bwmarrin/discordgo"
+	"github.com/disgoorg/disgo/voice"
 	"github.com/stieneee/gopus"
 	"github.com/stieneee/gumble/gumble"
 	"github.com/stieneee/mumble-discord-bridge/pkg/sleepct"
@@ -113,9 +113,9 @@ func (dd *DiscordDuplex) toDiscordSender(ctx context.Context) {
 	var totalPacketsSent int64
 
 	internalSend := func(opus []byte) {
-		// Get opus channels - this atomically checks connection state, readiness, and channel availability
-		opusSend, _, connectionReady := dd.Bridge.DiscordVoiceConnectionManager.GetOpusChannels()
-		if !connectionReady || opusSend == nil {
+		// Get voice connection - check readiness
+		conn, connectionReady := dd.Bridge.DiscordVoiceConnectionManager.GetVoiceConn()
+		if !connectionReady || conn == nil {
 			if lastReady {
 				dd.Bridge.Logger.Debug("DISCORD_SEND", "Discord connection not ready, sinking packet")
 				lastReady = false
@@ -131,21 +131,24 @@ func (dd *DiscordDuplex) toDiscordSender(ctx context.Context) {
 			lastReady = true
 		}
 
-		// Send opus packet with timeout protection using safely obtained channel
 		select {
-		case opusSend <- opus:
-			totalPacketsSent++
-			promDiscordSentPackets.Inc()
-			// Drift: wall clock elapsed minus audio time represented by packets sent.
-			// Grows during silence when MDB doesn't send. The discordgo fork advances
-			// the actual RTP timestamp across silence, so this tracks MDB's send gaps.
-			promRtpTimestampDrift.Set(time.Since(senderStart).Seconds() - float64(totalPacketsSent)*0.02)
 		case <-ctx.Done():
-			// Context canceled, don't log as error
+			return
 		default:
-			// Channel full - this is not a connection issue, just congestion
-			dd.Bridge.Logger.Debug("DISCORD_SEND", "Discord send channel full, dropping packet")
 		}
+
+		_, err := conn.UDP().Write(opus)
+		if err != nil {
+			dd.Bridge.Logger.Debug("DISCORD_SEND", fmt.Sprintf("Error writing opus to Discord: %v", err))
+			dd.Bridge.DiscordVoiceConnectionManager.MarkConnUnhealthy()
+			return
+		}
+		totalPacketsSent++
+		promDiscordSentPackets.Inc()
+		// Drift: wall clock elapsed minus audio time represented by packets sent.
+		// Grows during silence when MDB doesn't send. Disgo advances the actual RTP
+		// timestamp across silence, so this tracks MDB's send gaps.
+		promRtpTimestampDrift.Set(time.Since(senderStart).Seconds() - float64(totalPacketsSent)*0.02)
 	}
 
 	setSpeaking := func(speaking bool) {
@@ -153,12 +156,11 @@ func (dd *DiscordDuplex) toDiscordSender(ctx context.Context) {
 		if connManager == nil {
 			return
 		}
-		connection := connManager.GetReadyConnection()
-		if connection == nil {
+		conn, ready := connManager.GetVoiceConn()
+		if !ready || conn == nil {
 			if speaking {
 				dd.Bridge.Logger.Debug("DISCORD_SEND", "Discord connection not available for speaking status")
 			}
-
 			return
 		}
 		func() {
@@ -167,7 +169,15 @@ func (dd *DiscordDuplex) toDiscordSender(ctx context.Context) {
 					dd.Bridge.Logger.Error("DISCORD_SEND", fmt.Sprintf("Panic setting speaking status: %v", r))
 				}
 			}()
-			if err := connection.Speaking(speaking); err != nil {
+			speakingCtx, cancel := context.WithTimeout(ctx, time.Second)
+			defer cancel()
+			var flag voice.SpeakingFlags
+			if speaking {
+				flag = voice.SpeakingFlagMicrophone
+			} else {
+				flag = voice.SpeakingFlagNone
+			}
+			if err := conn.SetSpeaking(speakingCtx, flag); err != nil {
 				dd.Bridge.Logger.Error("DISCORD_SEND", fmt.Sprintf("Error setting speaking status to %v: %v", speaking, err))
 			}
 		}()
@@ -273,7 +283,7 @@ func (dd *DiscordDuplex) toDiscordSender(ctx context.Context) {
 	}
 }
 
-// ReceivePCM will receive on the the Discordgo OpusRecv channel and decode
+// ReceivePCM will receive voice packets from the Discord voice connection and decode
 // the opus audio into PCM then send it on the provided channel.
 func (dd *DiscordDuplex) discordReceivePCM(ctx context.Context) {
 	var err error
@@ -281,15 +291,21 @@ func (dd *DiscordDuplex) discordReceivePCM(ctx context.Context) {
 	lastReady := true
 
 	for {
-		// Get opus channels - this atomically checks connection state, readiness, and channel availability
-		_, opusRecv, connectionReady := dd.Bridge.DiscordVoiceConnectionManager.GetOpusChannels()
-		if !connectionReady || opusRecv == nil {
+		select {
+		case <-ctx.Done():
+			dd.Bridge.Logger.Info("DISCORD_RECEIVE", "Stopping Discord receive PCM")
+			return
+		default:
+		}
+
+		// Get voice connection
+		conn, connectionReady := dd.Bridge.DiscordVoiceConnectionManager.GetVoiceConn()
+		if !connectionReady || conn == nil {
 			if lastReady {
 				dd.Bridge.Logger.Debug("DISCORD_RECEIVE", "Discord connection not ready for receiving")
 				lastReady = false
 			}
 			time.Sleep(connectionCheckInterval * time.Millisecond)
-
 			continue
 		}
 
@@ -299,30 +315,30 @@ func (dd *DiscordDuplex) discordReceivePCM(ctx context.Context) {
 			lastReady = true
 		}
 
-		var ok bool
-		var p *discordgo.Packet
+		// Set a read deadline so we can periodically check context and connection health
+		conn.UDP().SetReadDeadline(time.Now().Add(100 * time.Millisecond)) //nolint:errcheck
 
-		select {
-		case <-ctx.Done():
-			dd.Bridge.Logger.Info("DISCORD_RECEIVE", "Stopping Discord receive PCM")
-
-			return
-		case p, ok = <-opusRecv:
-			// Process packet normally
-		case <-time.After(100 * time.Millisecond):
-			// Timeout - loop back to re-check connection status and get fresh channels
+		p, readErr := conn.UDP().ReadPacket()
+		if readErr != nil {
+			if isTimeoutError(readErr) {
+				// Normal deadline expiry - loop and check context
+				continue
+			}
+			if isNetworkError(readErr) {
+				dd.Bridge.Logger.Debug("DISCORD_RECEIVE", fmt.Sprintf("Network error receiving packet: %v", readErr))
+				continue
+			}
+			dd.Bridge.Logger.Debug("DISCORD_RECEIVE", fmt.Sprintf("Read error: %v", readErr))
 			continue
 		}
 
-		if !ok {
-			dd.Bridge.Logger.Debug("DISCORD_RECEIVE", "Opus not ok")
-
+		if p == nil {
 			continue
 		}
 
 		dd.discordMutex.Lock()
 
-		_, ok = dd.fromDiscordMap[p.SSRC]
+		_, ok := dd.fromDiscordMap[p.SSRC]
 		if !ok {
 			newStream := fromDiscord{}
 			newStream.pcm = make(chan []int16, 100)
@@ -333,7 +349,6 @@ func (dd *DiscordDuplex) discordReceivePCM(ctx context.Context) {
 			if err != nil {
 				OnError("error creating opus decoder", err)
 				dd.discordMutex.Unlock()
-
 				continue
 			}
 
@@ -353,7 +368,6 @@ func (dd *DiscordDuplex) discordReceivePCM(ctx context.Context) {
 			s.lastSequence = p.Sequence
 			dd.fromDiscordMap[p.SSRC] = s
 			dd.discordMutex.Unlock()
-
 			continue
 		}
 
@@ -377,7 +391,6 @@ func (dd *DiscordDuplex) discordReceivePCM(ctx context.Context) {
 						dd.Bridge.Logger.Debug("DISCORD_RECEIVE", "PLC decode error, resetting decoder")
 						s.decoder.ResetState()
 						s.receiving = false
-
 						break
 					}
 					// Push PLC audio in 10ms chunks (same as normal packets)
@@ -414,11 +427,11 @@ func (dd *DiscordDuplex) discordReceivePCM(ctx context.Context) {
 		dd.discordMutex.Unlock()
 
 		// Always decode with standard frame size - opus packet header contains actual duration
-		p.PCM, err = s.decoder.Decode(p.Opus, opusFrameSize, false)
-		if err != nil {
+		decodedPCM, decodeErr := s.decoder.Decode(p.Opus, opusFrameSize, false)
+		if decodeErr != nil {
 			dd.Bridge.Logger.Warn("DISCORD_RECEIVE", fmt.Sprintf(
 				"Opus decode error: %v | SSRC=%d seq=%d ts=%d opusLen=%d receiving=%v prevSeq=%d prevTS=%d",
-				err, p.SSRC, p.Sequence, p.Timestamp, len(p.Opus), s.receiving, prevSeq, prevTS))
+				decodeErr, p.SSRC, p.Sequence, p.Timestamp, len(p.Opus), s.receiving, prevSeq, prevTS))
 
 			// Reset decoder to recover from corrupted state
 			dd.discordMutex.Lock()
@@ -428,7 +441,6 @@ func (dd *DiscordDuplex) discordReceivePCM(ctx context.Context) {
 				dd.fromDiscordMap[p.SSRC] = entry
 			}
 			dd.discordMutex.Unlock()
-
 			continue
 		}
 
@@ -436,12 +448,10 @@ func (dd *DiscordDuplex) discordReceivePCM(ctx context.Context) {
 
 		// Push data into pcm channel in 10ms chunks of mono pcm data
 		dd.discordMutex.Lock()
-		for l := 0; l < len(p.PCM); l += pcmChunkSize {
+		for l := 0; l < len(decodedPCM); l += pcmChunkSize {
 			var next []int16
 			u := l + pcmChunkSize
-
-			next = p.PCM[l:u]
-
+			next = decodedPCM[l:u]
 			select {
 			case dd.fromDiscordMap[p.SSRC].pcm <- next:
 			default:

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bwmarrin/discordgo"
+	"github.com/disgoorg/disgo/voice"
 	"github.com/stieneee/gopus"
 	"github.com/stieneee/gumble/gumble"
 	"github.com/stretchr/testify/assert"
@@ -557,26 +557,10 @@ func TestSequenceGap_EdgeCases(t *testing.T) {
 
 // --- Integration test helpers for discordReceivePCM ---
 
-// createTestDiscordVoiceConnectionManager creates a DiscordVoiceConnectionManager
-// with injected opus channels for testing, bypassing the need for a real Discord session.
-func createTestDiscordVoiceConnectionManager(opusSend chan []byte, opusRecv chan *discordgo.Packet) *DiscordVoiceConnectionManager {
-	base := NewBaseConnectionManager(NewMockLogger(), "discord-test", NewMockBridgeEventEmitter())
-	base.SetStatus(ConnectionConnected, nil)
-
-	// Create a mock VoiceConnection with Ready=true so GetOpusChannels returns ready
-	voiceConn := &discordgo.VoiceConnection{}
-	voiceConn.Lock()
-	voiceConn.Ready = true
-	voiceConn.Unlock()
-
-	mgr := &DiscordVoiceConnectionManager{
-		BaseConnectionManager: base,
-		connection:            voiceConn,
-	}
-	mgr.opusSend = opusSend
-	mgr.opusRecv = opusRecv
-
-	return mgr
+// createTestDiscordVoiceConnectionManagerWithMockConn creates a DiscordVoiceConnectionManager
+// with an injected mock voice connection for testing discordReceivePCM.
+func createTestDiscordVoiceConnectionManagerWithMockConn(mockConn *mockVoiceConn) *DiscordVoiceConnectionManager {
+	return createTestDiscordVoiceConnectionManager(mockConn)
 }
 
 // encodeOpusSilence encodes a frame of silence using a real opus encoder.
@@ -598,14 +582,9 @@ func encodeOpusSilence(t *testing.T) []byte {
 	return opus
 }
 
-// makePacket creates a discordgo.Packet with the given parameters.
-func makePacket(ssrc uint32, seq uint16, ts uint32, opus []byte) *discordgo.Packet {
-	return &discordgo.Packet{
-		SSRC:      ssrc,
-		Sequence:  seq,
-		Timestamp: ts,
-		Opus:      opus,
-	}
+// makePacket creates a voice.Packet with the given parameters.
+func makePacket(ssrc uint32, seq uint16, ts uint32, opus []byte) *voice.Packet {
+	return makeVoicePacket(ssrc, seq, ts, opus)
 }
 
 // drainPCM reads all available PCM chunks from the channel within the timeout.
@@ -628,12 +607,11 @@ func drainPCM(ch <-chan []int16, timeout time.Duration) [][]int16 {
 // TestDiscordReceivePCM_NormalFlow exercises the full decode + chunking pipeline
 // by feeding sequential opus packets through discordReceivePCM.
 func TestDiscordReceivePCM_NormalFlow(t *testing.T) {
-	opusSend := make(chan []byte, 10)
-	opusRecv := make(chan *discordgo.Packet, 10)
+	mockConn := newMockVoiceConn()
 
 	logger := NewMockLogger()
 	bridge := createTestBridgeState(logger)
-	bridge.DiscordVoiceConnectionManager = createTestDiscordVoiceConnectionManager(opusSend, opusRecv)
+	bridge.DiscordVoiceConnectionManager = createTestDiscordVoiceConnectionManagerWithMockConn(mockConn)
 
 	duplex := NewDiscordDuplex(bridge)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -645,9 +623,9 @@ func TestDiscordReceivePCM_NormalFlow(t *testing.T) {
 	ssrc := uint32(1000)
 
 	// Send 3 sequential packets
-	opusRecv <- makePacket(ssrc, 100, 48000, opusData)
-	opusRecv <- makePacket(ssrc, 101, 48960, opusData)
-	opusRecv <- makePacket(ssrc, 102, 49920, opusData)
+	mockConn.udp.packetChan <- makePacket(ssrc, 100, 48000, opusData)
+	mockConn.udp.packetChan <- makePacket(ssrc, 101, 48960, opusData)
+	mockConn.udp.packetChan <- makePacket(ssrc, 102, 49920, opusData)
 
 	// Wait for processing
 	time.Sleep(200 * time.Millisecond)
@@ -675,12 +653,11 @@ func TestDiscordReceivePCM_NormalFlow(t *testing.T) {
 // TestDiscordReceivePCM_PLCIntegration exercises PLC frame generation through
 // the actual discordReceivePCM path by introducing a sequence gap.
 func TestDiscordReceivePCM_PLCIntegration(t *testing.T) {
-	opusSend := make(chan []byte, 10)
-	opusRecv := make(chan *discordgo.Packet, 10)
+	mockConn := newMockVoiceConn()
 
 	logger := NewMockLogger()
 	bridge := createTestBridgeState(logger)
-	bridge.DiscordVoiceConnectionManager = createTestDiscordVoiceConnectionManager(opusSend, opusRecv)
+	bridge.DiscordVoiceConnectionManager = createTestDiscordVoiceConnectionManagerWithMockConn(mockConn)
 
 	duplex := NewDiscordDuplex(bridge)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -692,7 +669,7 @@ func TestDiscordReceivePCM_PLCIntegration(t *testing.T) {
 	ssrc := uint32(2000)
 
 	// Send first packet to establish stream
-	opusRecv <- makePacket(ssrc, 100, 48000, opusData)
+	mockConn.udp.packetChan <- makePacket(ssrc, 100, 48000, opusData)
 	time.Sleep(50 * time.Millisecond)
 
 	// Drain the first packet's PCM
@@ -702,7 +679,7 @@ func TestDiscordReceivePCM_PLCIntegration(t *testing.T) {
 	drainPCM(s.pcm, 100*time.Millisecond)
 
 	// Send packet with gap of 2 (seq 101 and 102 are "lost")
-	opusRecv <- makePacket(ssrc, 103, 48000+960*3, opusData)
+	mockConn.udp.packetChan <- makePacket(ssrc, 103, 48000+960*3, opusData)
 	time.Sleep(200 * time.Millisecond)
 
 	// Expect: 2 PLC frames (2 chunks each) + 1 real frame (2 chunks) = 6 chunks
@@ -721,12 +698,11 @@ func TestDiscordReceivePCM_PLCIntegration(t *testing.T) {
 // TestDiscordReceivePCM_FrozenTimestampIntegration verifies that packets with
 // frozen timestamps (same timestamp, different sequence) are skipped.
 func TestDiscordReceivePCM_FrozenTimestampIntegration(t *testing.T) {
-	opusSend := make(chan []byte, 10)
-	opusRecv := make(chan *discordgo.Packet, 10)
+	mockConn := newMockVoiceConn()
 
 	logger := NewMockLogger()
 	bridge := createTestBridgeState(logger)
-	bridge.DiscordVoiceConnectionManager = createTestDiscordVoiceConnectionManager(opusSend, opusRecv)
+	bridge.DiscordVoiceConnectionManager = createTestDiscordVoiceConnectionManagerWithMockConn(mockConn)
 
 	duplex := NewDiscordDuplex(bridge)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -739,7 +715,7 @@ func TestDiscordReceivePCM_FrozenTimestampIntegration(t *testing.T) {
 	ts := uint32(48000)
 
 	// Send first normal packet
-	opusRecv <- makePacket(ssrc, 100, ts, opusData)
+	mockConn.udp.packetChan <- makePacket(ssrc, 100, ts, opusData)
 	time.Sleep(50 * time.Millisecond)
 
 	// Drain first packet's PCM
@@ -749,7 +725,7 @@ func TestDiscordReceivePCM_FrozenTimestampIntegration(t *testing.T) {
 	drainPCM(s.pcm, 100*time.Millisecond)
 
 	// Send frozen timestamp packet (same timestamp, advanced sequence)
-	opusRecv <- makePacket(ssrc, 101, ts, opusData) // ts unchanged = frozen
+	mockConn.udp.packetChan <- makePacket(ssrc, 101, ts, opusData) // ts unchanged = frozen
 	time.Sleep(100 * time.Millisecond)
 
 	// Should produce NO PCM output (packet was skipped)
@@ -764,7 +740,7 @@ func TestDiscordReceivePCM_FrozenTimestampIntegration(t *testing.T) {
 	assert.True(t, logger.ContainsMessage("frozen timestamp"), "Should log frozen timestamp skip")
 
 	// Send next normal packet (with advanced timestamp) to confirm stream still works
-	opusRecv <- makePacket(ssrc, 102, ts+960, opusData)
+	mockConn.udp.packetChan <- makePacket(ssrc, 102, ts+960, opusData)
 	time.Sleep(100 * time.Millisecond)
 
 	duplex.discordMutex.Lock()
@@ -778,12 +754,11 @@ func TestDiscordReceivePCM_FrozenTimestampIntegration(t *testing.T) {
 // TestDiscordReceivePCM_MajorDiscontinuityIntegration verifies that large sequence
 // gaps (>maxPLCPackets) reset the decoder without generating PLC frames.
 func TestDiscordReceivePCM_MajorDiscontinuityIntegration(t *testing.T) {
-	opusSend := make(chan []byte, 10)
-	opusRecv := make(chan *discordgo.Packet, 10)
+	mockConn := newMockVoiceConn()
 
 	logger := NewMockLogger()
 	bridge := createTestBridgeState(logger)
-	bridge.DiscordVoiceConnectionManager = createTestDiscordVoiceConnectionManager(opusSend, opusRecv)
+	bridge.DiscordVoiceConnectionManager = createTestDiscordVoiceConnectionManagerWithMockConn(mockConn)
 
 	duplex := NewDiscordDuplex(bridge)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -795,7 +770,7 @@ func TestDiscordReceivePCM_MajorDiscontinuityIntegration(t *testing.T) {
 	ssrc := uint32(4000)
 
 	// Send first packet to establish stream
-	opusRecv <- makePacket(ssrc, 100, 48000, opusData)
+	mockConn.udp.packetChan <- makePacket(ssrc, 100, 48000, opusData)
 	time.Sleep(50 * time.Millisecond)
 
 	// Drain first packet's PCM
@@ -805,7 +780,7 @@ func TestDiscordReceivePCM_MajorDiscontinuityIntegration(t *testing.T) {
 	drainPCM(s.pcm, 100*time.Millisecond)
 
 	// Send packet with major gap (99 lost > maxPLCPackets=10)
-	opusRecv <- makePacket(ssrc, 200, 48000+960*100, opusData)
+	mockConn.udp.packetChan <- makePacket(ssrc, 200, 48000+960*100, opusData)
 	time.Sleep(200 * time.Millisecond)
 
 	duplex.discordMutex.Lock()

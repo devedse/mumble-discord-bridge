@@ -10,10 +10,16 @@ ARG DATE=unknown
 WORKDIR /go/src/app
 COPY . .
 
-RUN apt update && apt install -y libopus-dev
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libopus-dev curl unzip pkg-config ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install libdave (Discord DAVE E2EE protocol) - uses prebuilt glibc binaries
+RUN NON_INTERACTIVE=1 bash scripts/libdave_install.sh v1.1.0
 
 # Build the binary with version info
-RUN CGO_ENABLED=1 go build -tags=netgo \
+RUN export PKG_CONFIG_PATH="$HOME/.local/lib/pkgconfig:$PKG_CONFIG_PATH" && \
+    CGO_ENABLED=1 go build \
     -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${DATE} -X main.builtBy=docker" \
     -o /mumble-discord-bridge \
     ./cmd/mumble-discord-bridge
@@ -22,7 +28,8 @@ RUN CGO_ENABLED=1 go build -tags=netgo \
 RUN go install github.com/google/go-licenses@latest && \
     go-licenses save ./cmd/mumble-discord-bridge --force --save_path="/LICENSES"
 
-# Output stage - just the binary and licenses
+# Output stage - just the binary, licenses, and libdave
 FROM scratch AS export
 COPY --from=builder /mumble-discord-bridge /mumble-discord-bridge
 COPY --from=builder /LICENSES /LICENSES
+COPY --from=builder /root/.local/lib/libdave.so /lib/libdave.so

@@ -18,7 +18,13 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Install libopus-dev
-        run: sudo apt update && sudo apt-get -y install libopus-dev
+        run: sudo apt update && sudo apt-get -y install libopus-dev curl unzip pkg-config
+
+      - name: Install libdave (Discord DAVE E2EE)
+        run: |
+          NON_INTERACTIVE=1 bash scripts/libdave_install.sh v1.1.0
+          echo "PKG_CONFIG_PATH=$HOME/.local/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$HOME/.local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> $GITHUB_ENV
 
       - name: Set up Go
         uses: actions/setup-go@v6

@@ -10,7 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bwmarrin/discordgo"
+	"github.com/disgoorg/disgo/bot"
+	"github.com/disgoorg/disgo/discord"
 	"github.com/stieneee/gumble/gumble"
 	"github.com/stieneee/gumble/gumbleutil"
 	"github.com/stieneee/mumble-discord-bridge/internal/bridge"
@@ -29,10 +30,10 @@ type DiscordProvider interface {
 	RegisterHandler(handlerFunc interface{})
 
 	// SendMessage sends a message to a channel
-	SendMessage(channelID, content string) (*discordgo.Message, error)
+	SendMessage(channelID, content string) (*discord.Message, error)
 
-	// GetSession returns the underlying Discord session
-	GetSession() *discordgo.Session
+	// GetClient returns the underlying Discord bot client
+	GetClient() *bot.Client
 }
 
 // BridgeConfig holds the configuration for a bridge instance
@@ -202,10 +203,10 @@ func NewBridgeInstanceWithContext(ctx context.Context, id string, config *Bridge
 	inst.setupMumbleListeners()
 	bridgeLogger.Debug("BRIDGE_INIT", "Mumble listeners attached successfully")
 
-	// Set the Discord session from the provider
-	bridgeLogger.Debug("BRIDGE_INIT", "Getting Discord session from provider")
-	inst.State.DiscordSession = inst.discordProvider.GetSession()
-	bridgeLogger.Debug("BRIDGE_INIT", "Discord session obtained successfully")
+	// Set the Discord client from the provider
+	bridgeLogger.Debug("BRIDGE_INIT", "Getting Discord client from provider")
+	inst.State.DiscordClient = inst.discordProvider.GetClient()
+	bridgeLogger.Debug("BRIDGE_INIT", "Discord client obtained successfully")
 
 	// Create the Discord listener
 	bridgeLogger.Debug("BRIDGE_INIT", "Creating Discord listener")
@@ -218,6 +219,7 @@ func NewBridgeInstanceWithContext(ctx context.Context, id string, config *Bridge
 	bridgeLogger.Info("BRIDGE_SETUP", "Registering Discord event handlers")
 
 	// Register Discord event handlers based on provider type
+	client := inst.discordProvider.GetClient()
 	if sharedClient, ok := inst.discordProvider.(*SharedDiscordClient); ok {
 		// Multi-bridge: route MessageCreate through SharedDiscordClient for channel isolation
 		bridgeLogger.Info("BRIDGE_SETUP", fmt.Sprintf("Registering with SharedDiscordClient's message router for GID: %s, CID: %s", config.DiscordGID, config.DiscordCID))
@@ -227,15 +229,19 @@ func NewBridgeInstanceWithContext(ctx context.Context, id string, config *Bridge
 			inst.State.DiscordListener.MessageCreate)
 		bridgeLogger.Info("BRIDGE_SETUP", "Message handler registered successfully")
 
-		// GuildCreate and VoiceUpdate still registered globally (they filter by GID)
-		inst.State.DiscordSession.AddHandler(inst.State.DiscordListener.GuildCreate)
-		inst.State.DiscordSession.AddHandler(inst.State.DiscordListener.VoiceUpdate)
+		// OnGuildReady and VoiceUpdate still registered globally (they filter by GID)
+		client.AddEventListeners(
+			bot.NewListenerFunc(inst.State.DiscordListener.OnGuildReady),
+			bot.NewListenerFunc(inst.State.DiscordListener.VoiceUpdate),
+		)
 	} else {
 		// Single-bridge: all handlers registered globally
-		bridgeLogger.Info("BRIDGE_SETUP", "Using direct session handlers")
-		inst.State.DiscordSession.AddHandler(inst.State.DiscordListener.MessageCreate)
-		inst.State.DiscordSession.AddHandler(inst.State.DiscordListener.GuildCreate)
-		inst.State.DiscordSession.AddHandler(inst.State.DiscordListener.VoiceUpdate)
+		bridgeLogger.Info("BRIDGE_SETUP", "Using direct client handlers")
+		client.AddEventListeners(
+			bot.NewListenerFunc(inst.State.DiscordListener.MessageCreate),
+			bot.NewListenerFunc(inst.State.DiscordListener.OnGuildReady),
+			bot.NewListenerFunc(inst.State.DiscordListener.VoiceUpdate),
+		)
 	}
 
 	// Set the bridge mode
@@ -287,13 +293,13 @@ func (b *BridgeInstance) Start() error {
 	}
 
 	// Validate essential configuration
-	b.logger.Debug("BRIDGE_START", "Validating Discord session")
-	if b.State.DiscordSession == nil {
-		b.logger.Error("BRIDGE_START", "Discord session is nil - cannot start bridge")
+	b.logger.Debug("BRIDGE_START", "Validating Discord client")
+	if b.State.DiscordClient == nil {
+		b.logger.Error("BRIDGE_START", "Discord client is nil - cannot start bridge")
 
-		return errors.New("discord session is nil")
+		return errors.New("discord client is nil")
 	}
-	b.logger.Debug("BRIDGE_START", "Discord session validation passed")
+	b.logger.Debug("BRIDGE_START", "Discord client validation passed")
 
 	// Discord event handlers were already registered during bridge creation
 	b.logger.Debug("BRIDGE_VERIFY", "Discord event handlers already registered during bridge creation")

@@ -9,16 +9,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bwmarrin/discordgo"
+	"github.com/disgoorg/disgo/bot"
+	"github.com/disgoorg/disgo/discord"
+	"github.com/disgoorg/snowflake/v2"
 	"github.com/stieneee/gumble/gumble"
 	"github.com/stieneee/mumble-discord-bridge/pkg/logger"
 )
 
 // DiscordUser represents a Discord user in the bridge.
 type DiscordUser struct {
-	username string
-	seen     bool
-	dm       *discordgo.Channel
+	username    string
+	seen        bool
+	dmChannelID snowflake.ID
 }
 
 // BridgeMode represents the operational mode of the bridge.
@@ -133,8 +135,8 @@ type BridgeState struct { //nolint:revive // API consistency: keeping Bridge pre
 	// The bridge mode constant, auto, manual. Default is constant.
 	Mode BridgeMode
 
-	// Discord session. This is created and outside the bridge state
-	DiscordSession *discordgo.Session
+	// Discord client. This is created and set outside the bridge state
+	DiscordClient *bot.Client
 
 	// Connection managers for smart connection handling
 	DiscordVoiceConnectionManager *DiscordVoiceConnectionManager
@@ -254,9 +256,9 @@ func (b *BridgeState) initializeConnectionManagers() error {
 	b.connectionCtx, b.connectionCancel = context.WithCancel(context.Background())
 
 	// Initialize Discord connection manager
-	if b.DiscordSession != nil && b.DiscordChannelID != "" {
+	if b.DiscordClient != nil && b.DiscordChannelID != "" {
 		b.DiscordVoiceConnectionManager = NewDiscordVoiceConnectionManager(
-			b.DiscordSession,
+			b.DiscordClient,
 			b.BridgeConfig.GID,
 			b.DiscordChannelID,
 			b.Logger,
@@ -264,7 +266,7 @@ func (b *BridgeState) initializeConnectionManagers() error {
 		)
 		b.Logger.Debug("BRIDGE", "Discord connection manager initialized")
 	} else {
-		return fmt.Errorf("discord session or channel ID not available")
+		return fmt.Errorf("discord client or channel ID not available")
 	}
 
 	// Initialize Mumble connection manager
@@ -623,90 +625,82 @@ func (b *BridgeState) stopConnectionManagers() {
 func (b *BridgeState) populateExistingDiscordUsers() {
 	b.Logger.Debug("BRIDGE", "Populating existing Discord users")
 
-	if b.DiscordSession == nil || b.DiscordChannelID == "" || b.BridgeConfig.GID == "" {
-		b.Logger.Debug("BRIDGE", "Cannot populate users - missing Discord session, channel ID, or guild ID")
-
+	if b.DiscordClient == nil || b.DiscordChannelID == "" || b.BridgeConfig.GID == "" {
+		b.Logger.Debug("BRIDGE", "Cannot populate users - missing Discord client, channel ID, or guild ID")
 		return
 	}
 
-	// Get the guild
-	guild, err := b.DiscordSession.State.Guild(b.BridgeConfig.GID)
+	guildID, err := snowflake.Parse(b.BridgeConfig.GID)
 	if err != nil {
-		b.Logger.Debug("BRIDGE", fmt.Sprintf("Could not get guild from state, trying API: %v", err))
-		guild, err = b.DiscordSession.Guild(b.BridgeConfig.GID)
-		if err != nil {
-			b.Logger.Error("BRIDGE", fmt.Sprintf("Could not get guild: %v", err))
-
-			return
-		}
+		b.Logger.Error("BRIDGE", fmt.Sprintf("Invalid guild ID %s: %v", b.BridgeConfig.GID, err))
+		return
 	}
 
-	b.Logger.Debug("BRIDGE", fmt.Sprintf("Found guild %s with %d voice states", guild.Name, len(guild.VoiceStates)))
+	botID := b.DiscordClient.ID()
+	channelID := b.DiscordChannelID
 
-	// Collect new users to add (avoid deadlock by not holding Discord lock when acquiring Bridge lock)
+	// Collect new users to add
 	type newUser struct {
-		userID   string
-		username string
-		dm       *discordgo.Channel
+		userID      string
+		username    string
+		dmChannelID snowflake.ID
 	}
 	var newUsers []newUser
 	var notifications []string
 
-	// First pass: collect user information without holding Discord users lock
-	for _, vs := range guild.VoiceStates {
-		if vs.ChannelID == b.DiscordChannelID {
-			if b.DiscordSession.State.User.ID == vs.UserID {
-				// Ignore bot
-				continue
-			}
-
-			// Check if user is already tracked (quick check with lock)
-			b.DiscordUsersMutex.Lock()
-			_, exists := b.DiscordUsers[vs.UserID]
-			b.DiscordUsersMutex.Unlock()
-
-			if exists {
-				b.Logger.Debug("BRIDGE", fmt.Sprintf("User %s already tracked", vs.UserID))
-
-				continue
-			}
-
-			// Get user information
-			user, err := b.DiscordSession.User(vs.UserID)
-			if err != nil {
-				b.Logger.Error("BRIDGE", fmt.Sprintf("Error looking up username for %s: %v", vs.UserID, err))
-
-				continue
-			}
-
-			// Create DM channel
-			dm, err := b.DiscordSession.UserChannelCreate(user.ID)
-			if err != nil {
-				b.Logger.Error("BRIDGE", fmt.Sprintf("Error creating private channel for %s: %v", user.Username, err))
-			}
-
-			// Store for later addition
-			newUsers = append(newUsers, newUser{
-				userID:   vs.UserID,
-				username: user.Username,
-				dm:       dm,
-			})
-
-			b.Logger.Info("BRIDGE", fmt.Sprintf("Found existing Discord user: %s", user.Username))
-			notifications = append(notifications, user.Username)
+	for vs := range b.DiscordClient.Caches.VoiceStates(guildID) {
+		if vs.ChannelID == nil || vs.ChannelID.String() != channelID {
+			continue
 		}
+		if vs.UserID == botID {
+			continue
+		}
+
+		// Check if user is already tracked
+		b.DiscordUsersMutex.Lock()
+		_, exists := b.DiscordUsers[vs.UserID.String()]
+		b.DiscordUsersMutex.Unlock()
+
+		if exists {
+			b.Logger.Debug("BRIDGE", fmt.Sprintf("User %s already tracked", vs.UserID.String()))
+			continue
+		}
+
+		// Get user information
+		user, err := b.DiscordClient.Rest.GetUser(vs.UserID)
+		if err != nil {
+			b.Logger.Error("BRIDGE", fmt.Sprintf("Error looking up username for %s: %v", vs.UserID.String(), err))
+			continue
+		}
+
+		// Create DM channel
+		var dmID snowflake.ID
+		dmCh, err := b.DiscordClient.Rest.CreateDMChannel(vs.UserID)
+		if err != nil {
+			b.Logger.Error("BRIDGE", fmt.Sprintf("Error creating private channel for %s: %v", user.Username, err))
+		} else {
+			dmID = dmCh.ID()
+		}
+
+		newUsers = append(newUsers, newUser{
+			userID:      vs.UserID.String(),
+			username:    user.Username,
+			dmChannelID: dmID,
+		})
+
+		b.Logger.Info("BRIDGE", fmt.Sprintf("Found existing Discord user: %s", user.Username))
+		notifications = append(notifications, user.Username)
 	}
 
-	// Second pass: add users to tracking map
+	// Add users to tracking map
 	if len(newUsers) > 0 {
 		b.DiscordUsersMutex.Lock()
 		for _, nu := range newUsers {
-			// Double-check user wasn't added by another goroutine
 			if _, exists := b.DiscordUsers[nu.userID]; !exists {
 				b.DiscordUsers[nu.userID] = DiscordUser{
-					username: nu.username,
-					seen:     true,
-					dm:       nu.dm,
+					username:    nu.username,
+					seen:        true,
+					dmChannelID: nu.dmChannelID,
 				}
 			}
 		}
@@ -717,16 +711,14 @@ func (b *BridgeState) populateExistingDiscordUsers() {
 		promDiscordUsers.Set(float64(userCount))
 		b.notifyMetricsChange()
 
-		// Send notifications asynchronously to avoid blocking
 		if len(notifications) > 0 {
+			// Send notifications asynchronously to avoid blocking
 			go b.sendMumbleNotifications(notifications)
 		}
 	} else {
 		b.Logger.Debug("BRIDGE", "No existing Discord users found in voice channel")
 	}
 
-	// Second trigger point for presence announcement: Discord users are now populated.
-	// Covers constant/manual mode where user list is populated asynchronously.
 	b.tryPresenceAnnouncement()
 }
 
@@ -1087,62 +1079,58 @@ func (b *BridgeState) MumblePingLoop(ctx context.Context) {
 }
 
 // PopulateExistingDiscordUsers checks the Discord voice channel for existing users.
-// This is needed because GuildCreate may fire before handlers are registered.
+// This is needed because GuildReady may fire before handlers are registered.
 func (b *BridgeState) PopulateExistingDiscordUsers() {
 	b.Logger.Debug("BRIDGE", "Populating existing Discord voice users")
 
-	session := b.DiscordSession
-	if session == nil || session.State == nil {
-		b.Logger.Warn("BRIDGE", "Discord session not ready, skipping user population")
-
+	if b.DiscordClient == nil {
+		b.Logger.Warn("BRIDGE", "Discord client not ready, skipping user population")
 		return
 	}
 
-	session.State.RLock()
-	guild, err := session.State.Guild(b.BridgeConfig.GID)
+	guildID, err := snowflake.Parse(b.BridgeConfig.GID)
 	if err != nil {
-		session.State.RUnlock()
-		b.Logger.Warn("BRIDGE", fmt.Sprintf("Could not get guild state: %v", err))
-
+		b.Logger.Error("BRIDGE", fmt.Sprintf("Invalid guild ID %s: %v", b.BridgeConfig.GID, err))
 		return
 	}
 
-	var voiceStates []*discordgo.VoiceState
-	if guild.VoiceStates != nil {
-		voiceStates = make([]*discordgo.VoiceState, len(guild.VoiceStates))
-		copy(voiceStates, guild.VoiceStates)
+	botID := b.DiscordClient.ID()
+	channelID := b.DiscordChannelID
+
+	var voiceStatesToProcess []discord.VoiceState
+	for vs := range b.DiscordClient.Caches.VoiceStates(guildID) {
+		voiceStatesToProcess = append(voiceStatesToProcess, vs)
 	}
-	session.State.RUnlock()
 
 	count := 0
 	b.DiscordUsersMutex.Lock()
-	for _, vs := range voiceStates {
-		if vs.ChannelID == b.DiscordChannelID {
-			if session.State.User != nil && session.State.User.ID == vs.UserID {
-				// Ignore bot
+	for _, vs := range voiceStatesToProcess {
+		if vs.ChannelID == nil || vs.ChannelID.String() != channelID {
+			continue
+		}
+		if vs.UserID == botID {
+			continue // skip bot
+		}
+		if _, exists := b.DiscordUsers[vs.UserID.String()]; !exists {
+			user, err := b.DiscordClient.Rest.GetUser(vs.UserID)
+			if err != nil {
+				b.Logger.Error("BRIDGE", fmt.Sprintf("Error looking up user %s: %v", vs.UserID.String(), err))
 				continue
 			}
-
-			if _, exists := b.DiscordUsers[vs.UserID]; !exists {
-				u, err := session.User(vs.UserID)
-				if err != nil {
-					b.Logger.Error("BRIDGE", fmt.Sprintf("Error looking up user %s: %v", vs.UserID, err))
-
-					continue
-				}
-
-				b.Logger.Info("BRIDGE", fmt.Sprintf("Found existing Discord user: %s", u.Username))
-				dm, err := session.UserChannelCreate(u.ID)
-				if err != nil {
-					b.Logger.Error("BRIDGE", fmt.Sprintf("Error creating DM channel for %s: %v", u.Username, err))
-				}
-				b.DiscordUsers[vs.UserID] = DiscordUser{
-					username: u.Username,
-					seen:     true,
-					dm:       dm,
-				}
-				count++
+			b.Logger.Info("BRIDGE", fmt.Sprintf("Found existing Discord user: %s", user.Username))
+			var dmID snowflake.ID
+			dmCh, err := b.DiscordClient.Rest.CreateDMChannel(vs.UserID)
+			if err != nil {
+				b.Logger.Error("BRIDGE", fmt.Sprintf("Error creating DM channel for %s: %v", user.Username, err))
+			} else {
+				dmID = dmCh.ID()
 			}
+			b.DiscordUsers[vs.UserID.String()] = DiscordUser{
+				username:    user.Username,
+				seen:        true,
+				dmChannelID: dmID,
+			}
+			count++
 		}
 	}
 	b.DiscordUsersMutex.Unlock()
@@ -1150,53 +1138,54 @@ func (b *BridgeState) PopulateExistingDiscordUsers() {
 	b.Logger.Info("BRIDGE", fmt.Sprintf("Populated %d existing Discord users", count))
 }
 
-// refreshDiscordVoiceUsers checks the Discord session state for users in the voice channel.
-// This is called periodically in auto mode to handle the case where GuildCreate
-// fires after initial startup (due to async event timing).
+// refreshDiscordVoiceUsers checks the Discord cache for users in the voice channel.
+// This is called periodically in auto mode.
 func (b *BridgeState) refreshDiscordVoiceUsers() {
-	session := b.DiscordSession
-	if session == nil || session.State == nil {
+	if b.DiscordClient == nil {
 		return
 	}
 
-	session.State.RLock()
-	guild, err := session.State.Guild(b.BridgeConfig.GID)
+	guildID, err := snowflake.Parse(b.BridgeConfig.GID)
 	if err != nil {
-		session.State.RUnlock()
-
 		return
 	}
 
-	var voiceStates []*discordgo.VoiceState
-	if guild.VoiceStates != nil {
-		voiceStates = make([]*discordgo.VoiceState, len(guild.VoiceStates))
-		copy(voiceStates, guild.VoiceStates)
+	botID := b.DiscordClient.ID()
+	channelID := b.DiscordChannelID
+
+	var voiceStates []discord.VoiceState
+	for vs := range b.DiscordClient.Caches.VoiceStates(guildID) {
+		voiceStates = append(voiceStates, vs)
 	}
-	session.State.RUnlock()
 
 	b.DiscordUsersMutex.Lock()
 	for _, vs := range voiceStates {
-		if vs.ChannelID == b.DiscordChannelID {
-			if session.State.User != nil && session.State.User.ID == vs.UserID {
-				continue // Skip bot
+		if vs.ChannelID == nil || vs.ChannelID.String() != channelID {
+			continue
+		}
+		if vs.UserID == botID {
+			continue
+		}
+
+		userIDStr := vs.UserID.String()
+		if _, exists := b.DiscordUsers[userIDStr]; !exists {
+			u, err := b.DiscordClient.Rest.GetUser(vs.UserID)
+			if err != nil {
+				continue
 			}
 
-			if _, exists := b.DiscordUsers[vs.UserID]; !exists {
-				u, err := session.User(vs.UserID)
-				if err != nil {
-					continue
-				}
-
-				b.Logger.Info("BRIDGE", fmt.Sprintf("Auto mode detected Discord user: %s", u.Username))
-				dm, err := session.UserChannelCreate(u.ID)
-				if err != nil {
-					b.Logger.Error("BRIDGE", fmt.Sprintf("Error creating DM channel for user %s: %v", u.Username, err))
-				}
-				b.DiscordUsers[vs.UserID] = DiscordUser{
-					username: u.Username,
-					seen:     true,
-					dm:       dm,
-				}
+			b.Logger.Info("BRIDGE", fmt.Sprintf("Auto mode detected Discord user: %s", u.Username))
+			var dmID snowflake.ID
+			dmCh, err := b.DiscordClient.Rest.CreateDMChannel(vs.UserID)
+			if err != nil {
+				b.Logger.Error("BRIDGE", fmt.Sprintf("Error creating DM channel for user %s: %v", u.Username, err))
+			} else {
+				dmID = dmCh.ID()
+			}
+			b.DiscordUsers[userIDStr] = DiscordUser{
+				username:    u.Username,
+				seen:        true,
+				dmChannelID: dmID,
 			}
 		}
 	}
@@ -1253,28 +1242,30 @@ func (b *BridgeState) discordSendMessage(msg string) {
 	switch b.BridgeConfig.DiscordTextMode {
 	case "disabled":
 		b.Logger.Debug("MUMBLE→DISCORD", "Message not sent - Discord text mode is disabled")
-
 		return
 	case "channel":
 		b.Logger.Debug("MUMBLE→DISCORD", fmt.Sprintf("Sending message to Discord channel: %s", b.DiscordChannelID))
-		_, err := b.DiscordSession.ChannelMessageSend(b.DiscordChannelID, msg)
+		chID, err := snowflake.Parse(b.DiscordChannelID)
+		if err != nil {
+			b.Logger.Error("MUMBLE→DISCORD", fmt.Sprintf("Invalid channel ID: %v", err))
+			return
+		}
+		_, err = b.DiscordClient.Rest.CreateMessage(chID, discord.MessageCreate{Content: msg})
 		if err != nil {
 			b.Logger.Error("MUMBLE→DISCORD", fmt.Sprintf("Error sending message to Discord: %v", err))
 		} else {
 			b.Logger.Debug("MUMBLE→DISCORD", "Successfully sent message to Discord channel")
 		}
-
 		return
 	case "user":
 		b.Logger.Debug("MUMBLE→DISCORD", fmt.Sprintf("Sending direct messages to %d Discord users", len(b.DiscordUsers)))
 		b.DiscordUsersMutex.Lock()
 		defer b.DiscordUsersMutex.Unlock()
-
 		for id := range b.DiscordUsers {
 			du := b.DiscordUsers[id]
-			if du.dm != nil {
+			if du.dmChannelID != 0 {
 				b.Logger.Debug("MUMBLE→DISCORD", fmt.Sprintf("Sending DM to user: %s", du.username))
-				_, err := b.DiscordSession.ChannelMessageSend(du.dm.ID, msg)
+				_, err := b.DiscordClient.Rest.CreateMessage(du.dmChannelID, discord.MessageCreate{Content: msg})
 				if err != nil {
 					b.Logger.Error("MUMBLE→DISCORD", fmt.Sprintf("Error sending DM to user %s: %v", du.username, err))
 				} else {
@@ -1284,11 +1275,9 @@ func (b *BridgeState) discordSendMessage(msg string) {
 				b.Logger.Debug("MUMBLE→DISCORD", fmt.Sprintf("No DM channel available for user: %s", du.username))
 			}
 		}
-
 		return
 	default:
 		b.Logger.Warn("MUMBLE→DISCORD", "Invalid DiscordTextMode")
-
 		return
 	}
 }

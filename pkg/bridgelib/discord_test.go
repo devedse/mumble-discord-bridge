@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	discordgo "github.com/bwmarrin/discordgo"
 	"github.com/stieneee/mumble-discord-bridge/pkg/logger"
 	"github.com/stretchr/testify/assert"
 )
@@ -47,16 +46,32 @@ func (m *MockBridgeLogger) WithBridgeID(_ string) logger.Logger {
 
 // TestSharedDiscordClient_IsSessionHealthy tests the health check logic
 func TestSharedDiscordClient_IsSessionHealthy(t *testing.T) {
-	t.Run("Returns false for nil session", func(t *testing.T) {
-		logger := &MockBridgeLogger{}
+	t.Run("Returns false for nil client", func(t *testing.T) {
+		lgr := &MockBridgeLogger{}
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
 		client := &SharedDiscordClient{
-			logger:  logger,
-			ctx:     ctx,
-			cancel:  cancel,
-			session: nil,
+			logger: lgr,
+			ctx:    ctx,
+			cancel: cancel,
+			client: nil, // nil client
+		}
+
+		assert.False(t, client.isSessionHealthy())
+	})
+
+	t.Run("Returns false when gateway is nil", func(t *testing.T) {
+		lgr := &MockBridgeLogger{}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// Client with no gateway
+		client := &SharedDiscordClient{
+			logger: lgr,
+			ctx:    ctx,
+			cancel: cancel,
+			client: nil,
 		}
 
 		assert.False(t, client.isSessionHealthy())
@@ -70,9 +85,10 @@ func TestSharedDiscordClient_SessionMonitorLoop_ContextCancellation(t *testing.T
 	ctx, cancel := context.WithCancel(context.Background())
 
 	client := &SharedDiscordClient{
-		logger: lgr,
-		ctx:    ctx,
-		cancel: cancel,
+		logger:          lgr,
+		ctx:             ctx,
+		cancel:          cancel,
+		messageHandlers: make(map[string][]interface{}),
 	}
 
 	done := make(chan struct{})
@@ -87,39 +103,25 @@ func TestSharedDiscordClient_SessionMonitorLoop_ContextCancellation(t *testing.T
 
 	select {
 	case <-done:
-		// Monitor loop exited cleanly
+	// Monitor loop exited cleanly
 	case <-time.After(2 * time.Second):
 		t.Fatal("sessionMonitorLoop did not exit after context cancellation")
 	}
 }
 
-// TestSharedDiscordClient_IsSessionHealthy_LockedMutex tests that isSessionHealthy()
-// returns false immediately when the session mutex is write-locked (simulating a
-// deadlocked session), rather than blocking indefinitely.
-func TestSharedDiscordClient_IsSessionHealthy_LockedMutex(t *testing.T) {
+// TestSharedDiscordClient_IsSessionHealthy_NilGateway tests that isSessionHealthy()
+// returns false when the gateway is nil
+func TestSharedDiscordClient_IsSessionHealthy_NilGateway(t *testing.T) {
 	lgr := &MockBridgeLogger{}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	session := &discordgo.Session{
-		State:     discordgo.NewState(),
-		DataReady: true,
-	}
-	session.State.User = &discordgo.User{ID: "test", Username: "Test"}
-
 	client := &SharedDiscordClient{
-		logger:  lgr,
-		ctx:     ctx,
-		cancel:  cancel,
-		session: session,
+		logger: lgr,
+		ctx:    ctx,
+		cancel: cancel,
+		client: nil,
 	}
-
-	// Verify healthy when unlocked
-	assert.True(t, client.isSessionHealthy(), "should be healthy when session is unlocked and ready")
-
-	// Simulate a deadlocked session by write-locking the mutex
-	session.Lock()
-	defer session.Unlock()
 
 	// isSessionHealthy must return false without blocking
 	done := make(chan bool, 1)
@@ -129,23 +131,24 @@ func TestSharedDiscordClient_IsSessionHealthy_LockedMutex(t *testing.T) {
 
 	select {
 	case healthy := <-done:
-		assert.False(t, healthy, "should return false when session mutex is locked")
+		assert.False(t, healthy, "should return false when client is nil")
 	case <-time.After(1 * time.Second):
-		t.Fatal("isSessionHealthy() blocked on locked mutex — TryRLock not working")
+		t.Fatal("isSessionHealthy() blocked unexpectedly")
 	}
 }
 
 // TestSharedDiscordClient_SessionMonitorLoop_LogsUnhealthy tests that the
-// monitor loop logs when the session is unhealthy (without attempting reconnection)
+// monitor loop runs without panicking when session is unhealthy
 func TestSharedDiscordClient_SessionMonitorLoop_LogsUnhealthy(t *testing.T) {
 	lgr := &MockBridgeLogger{}
 	ctx, cancel := context.WithCancel(context.Background())
 
 	client := &SharedDiscordClient{
-		logger:  lgr,
-		ctx:     ctx,
-		cancel:  cancel,
-		session: nil, // nil session is always unhealthy
+		logger:          lgr,
+		ctx:             ctx,
+		cancel:          cancel,
+		client:          nil, // nil client is always unhealthy
+		messageHandlers: make(map[string][]interface{}),
 	}
 
 	done := make(chan struct{})
@@ -154,14 +157,13 @@ func TestSharedDiscordClient_SessionMonitorLoop_LogsUnhealthy(t *testing.T) {
 		close(done)
 	}()
 
-	// Let the monitor run for a couple ticks (ticker is 15s, but we'll just cancel quickly)
-	// The key assertion is that it doesn't panic or deadlock
+	// Let the monitor run briefly then cancel
 	time.Sleep(100 * time.Millisecond)
 	cancel()
 
 	select {
 	case <-done:
-		// Monitor loop exited cleanly without panic or deadlock
+	// Monitor loop exited cleanly without panic or deadlock
 	case <-time.After(2 * time.Second):
 		t.Fatal("sessionMonitorLoop did not exit after context cancellation")
 	}

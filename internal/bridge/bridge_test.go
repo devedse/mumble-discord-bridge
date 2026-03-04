@@ -457,12 +457,12 @@ func TestBridge_EmitUserEvent(t *testing.T) {
 // TestBridge_DiscordUserStruct tests DiscordUser struct fields
 func TestBridge_DiscordUserStruct(t *testing.T) {
 	user := DiscordUser{
-		username: "TestUser",
-		seen:     true,
-		dm:       nil,
+		username:    "TestUser",
+		seen:        true,
+		dmChannelID: 0,
 	}
 
 	assert.Equal(t, "TestUser", user.username)
 	assert.True(t, user.seen)
-	assert.Nil(t, user.dm)
+	assert.Equal(t, uint64(0), uint64(user.dmChannelID))
 }

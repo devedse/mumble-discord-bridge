@@ -23,7 +23,13 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libopus-dev libopusfile-dev
+          sudo apt-get install -y libopus-dev libopusfile-dev curl unzip pkg-config
+
+      - name: Install libdave (Discord DAVE E2EE)
+        run: |
+          NON_INTERACTIVE=1 bash scripts/libdave_install.sh v1.1.0
+          echo "PKG_CONFIG_PATH=$HOME/.local/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$HOME/.local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> $GITHUB_ENV
 
       - name: Download Go modules
         run: go mod download
@@ -63,7 +69,13 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libopus-dev libopusfile-dev
+          sudo apt-get install -y libopus-dev libopusfile-dev curl unzip pkg-config
+
+      - name: Install libdave (Discord DAVE E2EE)
+        run: |
+          NON_INTERACTIVE=1 bash scripts/libdave_install.sh v1.1.0
+          echo "PKG_CONFIG_PATH=$HOME/.local/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$HOME/.local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> $GITHUB_ENV
 
       - name: Download Go modules
         run: go mod download
@@ -86,7 +98,13 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libopus-dev libopusfile-dev
+          sudo apt-get install -y libopus-dev libopusfile-dev curl unzip pkg-config
+
+      - name: Install libdave (Discord DAVE E2EE)
+        run: |
+          NON_INTERACTIVE=1 bash scripts/libdave_install.sh v1.1.0
+          echo "PKG_CONFIG_PATH=$HOME/.local/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$HOME/.local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> $GITHUB_ENV
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
